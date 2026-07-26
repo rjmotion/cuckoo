@@ -201,7 +201,7 @@ def test_video_settings_arm_and_audio_block() -> None:
     payload = adoption.video_settings(camera, "10.0.0.1", 7550, ["video1"])
     assert payload["audio"] == {"bitRate": 64_000, "volume": 100}
     track = payload["video"]["video1"]
-    assert track["type"] == "h265"
+    assert track["type"] == "h264"  # default codec
     assert track["avSerializer"]["destinations"][0].startswith("tcp://10.0.0.1:7550")
     assert track["avSerializer"]["parameters"]["withOpus"] is True
 

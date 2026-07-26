@@ -14,6 +14,7 @@ from unifiwire import flv
 from unifiwire import hevc
 import media
 import rtsp
+import videofmt
 from test_media import (
     AAC_ASC,
     AAC_FRAME,
@@ -68,7 +69,7 @@ def test_sdp_omits_audio_until_the_camera_describes_it() -> None:
 def test_small_nal_goes_out_as_a_single_packet() -> None:
     packetiser = rtsp.Packetiser(rtsp.VIDEO_PAYLOAD_TYPE, rtsp.VIDEO_CLOCK, ssrc=1)
     frame = media.VideoFrame(timestamp=1000, units=[IDR], keyframe=False)
-    packets = list(packetiser.video(frame, hevc.ParameterSets()))
+    packets = list(packetiser.video(frame, hevc.ParameterSets(), videofmt.H265))
     assert len(packets) == 1
     assert packets[0][12:] == IDR
 
@@ -76,7 +77,7 @@ def test_small_nal_goes_out_as_a_single_packet() -> None:
 def test_timestamp_is_scaled_to_the_ninety_kilohertz_clock() -> None:
     packetiser = rtsp.Packetiser(rtsp.VIDEO_PAYLOAD_TYPE, rtsp.VIDEO_CLOCK, ssrc=1)
     frame = media.VideoFrame(timestamp=1000, units=[IDR], keyframe=False)
-    packet = next(iter(packetiser.video(frame, hevc.ParameterSets())))
+    packet = next(iter(packetiser.video(frame, hevc.ParameterSets(), videofmt.H265)))
     assert int.from_bytes(packet[4:8], "big") == 90_000
 
 
@@ -85,7 +86,7 @@ def test_keyframes_carry_the_parameter_sets_in_band() -> None:
     parameters = hevc.parse_hvcc(hvcc())
     packetiser = rtsp.Packetiser(rtsp.VIDEO_PAYLOAD_TYPE, rtsp.VIDEO_CLOCK, ssrc=1)
     frame = media.VideoFrame(timestamp=0, units=[IDR], keyframe=True)
-    payloads = [p[12:] for p in packetiser.video(frame, parameters)]
+    payloads = [p[12:] for p in packetiser.video(frame, parameters, videofmt.H265)]
     assert payloads == [VPS, SPS, PPS, IDR]
 
 
@@ -93,9 +94,9 @@ def test_large_nal_is_fragmented_with_start_and_end_flags() -> None:
     big = IDR[:2] + bytes(rtsp.MTU_PAYLOAD * 2)
     packetiser = rtsp.Packetiser(rtsp.VIDEO_PAYLOAD_TYPE, rtsp.VIDEO_CLOCK, ssrc=1)
     frame = media.VideoFrame(timestamp=0, units=[big], keyframe=False)
-    packets = [p[12:] for p in packetiser.video(frame, hevc.ParameterSets())]
+    packets = [p[12:] for p in packetiser.video(frame, hevc.ParameterSets(), videofmt.H265)]
     assert len(packets) > 1
-    assert all((p[0] >> 1) & 0x3F == rtsp.FU_TYPE for p in packets)
+    assert all((p[0] >> 1) & 0x3F == videofmt.H265.fu_type for p in packets)
     assert packets[0][2] & 0x80, "first fragment sets S"
     assert packets[-1][2] & 0x40, "last fragment sets E"
     assert all(p[2] & 0x3F == 19 for p in packets), "the original NAL type is carried"
@@ -106,14 +107,14 @@ def test_large_nal_is_fragmented_with_start_and_end_flags() -> None:
 def test_only_the_last_packet_of_a_frame_marks_it() -> None:
     packetiser = rtsp.Packetiser(rtsp.VIDEO_PAYLOAD_TYPE, rtsp.VIDEO_CLOCK, ssrc=1)
     frame = media.VideoFrame(timestamp=0, units=[IDR, IDR], keyframe=False)
-    markers = [bool(p[1] & 0x80) for p in packetiser.video(frame, hevc.ParameterSets())]
+    markers = [bool(p[1] & 0x80) for p in packetiser.video(frame, hevc.ParameterSets(), videofmt.H265)]
     assert markers == [False, True]
 
 
 def test_sequence_numbers_advance() -> None:
     packetiser = rtsp.Packetiser(rtsp.VIDEO_PAYLOAD_TYPE, rtsp.VIDEO_CLOCK, ssrc=1)
     frame = media.VideoFrame(timestamp=0, units=[IDR, IDR, IDR], keyframe=False)
-    numbers = [int.from_bytes(p[2:4], "big") for p in packetiser.video(frame, hevc.ParameterSets())]
+    numbers = [int.from_bytes(p[2:4], "big") for p in packetiser.video(frame, hevc.ParameterSets(), videofmt.H265)]
     assert numbers == [1, 2, 3]
 
 

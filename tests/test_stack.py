@@ -186,7 +186,7 @@ def test_a_camera_is_adopted_and_the_onvif_face_reflects_it(tmp_path: Path) -> N
             stack.north.port, onvif.MEDIA_PATH, "GetProfiles",
             "http://www.onvif.org/ver10/media/wsdl",
         )
-        assert "H265" in profiles and onvif.PTZ_CONFIG in profiles
+        assert "H264" in profiles and onvif.PTZ_CONFIG in profiles
 
         uri = soap(
             stack.north.port, onvif.MEDIA_PATH, "GetStreamUri",

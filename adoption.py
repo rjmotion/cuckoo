@@ -9,7 +9,7 @@ acknowledged. Sent as a burst, the camera stops acking and resets the channel.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Final
 
 import ptz
@@ -231,7 +231,26 @@ def track_defaults() -> list[VideoTrack]:
     about what it accepted.
     """
     return [
-        VideoTrack("video1", 1, 0, 2688, 1512, 15, Codec.H265, 1_400_000),
-        VideoTrack("video2", 2, 1, 1280, 720, 15, Codec.H265, 500_000),
-        VideoTrack("video3", 4, 2, 640, 360, 15, Codec.H265, 300_000),
+        # Default codec H.264: an ONVIF client (Home Assistant) needs an H.264
+        # profile, so a channel armed without an explicit codec gets one. Override
+        # per channel with `--tracks video2:h265` or the config file.
+        VideoTrack("video1", 1, 0, 2688, 1512, 15, Codec.H264, 1_400_000),
+        VideoTrack("video2", 2, 1, 1280, 720, 15, Codec.H264, 500_000),
+        VideoTrack("video3", 4, 2, 640, 360, 15, Codec.H264, 300_000),
+    ]
+
+
+def set_track_codecs(camera: Camera, codecs: dict[str, Codec]) -> None:
+    """Pin the codec each named track should encode.
+
+    The model is the single source of truth: the same `codec` a track carries is
+    what `video_settings` asks the camera to encode and what the ONVIF face
+    advertises. Home Assistant's ONVIF integration requires an H.264 profile, so a
+    track is pinned to `h264` for it while another stays `h265` — the camera
+    encodes both natively (`videoCodecs: [h264, h265, mjpg]`).
+    """
+    if not codecs:
+        return
+    camera.tracks = [
+        replace(track, codec=codecs.get(track.name, track.codec)) for track in camera.tracks
     ]

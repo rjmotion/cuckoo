@@ -138,17 +138,56 @@ def test_unparseable_body_is_rejected() -> None:
 # ------------------------------------------------------------------------- media
 
 
-def test_profiles_describe_h265_and_carry_the_ptz_configuration() -> None:
+def test_profiles_describe_the_encoding_and_carry_the_ptz_configuration() -> None:
     service, _ = services()
     body = ask(service, "GetProfiles")
     assert body.count("<trt:Profiles") == 3, "one profile per armed track"
-    assert "<tt:Encoding>H265</tt:Encoding>" in body
+    assert "<tt:Encoding>H264</tt:Encoding>" in body, "default codec"
     assert f'token="{onvif.PTZ_CONFIG}"' in body
 
 
 def test_profiles_omit_ptz_for_a_fixed_camera() -> None:
     service, _ = services(a_camera(ptz=False))
     assert onvif.PTZ_CONFIG not in ask(service, "GetProfiles")
+
+
+def _encoder_config(token: str, encoding: str) -> str:
+    return (
+        f'<trt:Configuration xmlns:trt="urn:x" token="{token}">'
+        f'<tt:Encoding xmlns:tt="urn:y">{encoding}</tt:Encoding></trt:Configuration>'
+    )
+
+
+def test_set_video_encoder_configuration_asks_the_controller_to_rearm() -> None:
+    recorded: list[tuple[str, str]] = []
+
+    def rearm(token: str, codec: str) -> bool:
+        recorded.append((token, codec))
+        return True
+
+    camera = a_camera()
+    backend = onvif.Backend(
+        camera=lambda: camera,
+        stream_uri=lambda token: f"rtsp://10.0.0.1/{token}",
+        snapshot_uri=lambda token: f"http://10.0.0.1/{token}",
+        set_encoder=rearm,
+    )
+    service = onvif.Services(backend, host="10.0.0.1", port=8000)
+    body = ask(service, "SetVideoEncoderConfiguration", _encoder_config("video2", "H265"))
+    assert "SetVideoEncoderConfigurationResponse" in body
+    assert recorded == [("video2", "h265")]
+
+
+def test_set_video_encoder_rejects_an_unknown_channel() -> None:
+    service, _ = services()
+    body = ask(service, "SetVideoEncoderConfiguration", _encoder_config("nope", "H264"))
+    assert "Fault" in body
+
+
+def test_set_video_encoder_rejects_an_unsupported_encoding() -> None:
+    service, _ = services()
+    body = ask(service, "SetVideoEncoderConfiguration", _encoder_config("video1", "VP9"))
+    assert "Fault" in body
 
 
 def test_stream_uri_is_the_rtsp_url_for_that_profile() -> None:

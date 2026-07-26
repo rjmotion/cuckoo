@@ -31,7 +31,7 @@ import snapshots
 from unifiwire import ws
 from unifiwire import envelope
 from unifiwire.envelope import CAMERA, HELLO, PARAM_AGREEMENT, TIME_SYNC, Envelope, Ids, decode
-from model import Camera, Preset
+from model import Camera, Codec, Preset
 
 CONTROL_PORT: Final = 7442
 READ_SIZE: Final = 65536
@@ -88,6 +88,7 @@ class Controller:
         control_port: int = CONTROL_PORT,
         ingest_port: int = 7550,
         tracks: list[str] | None = None,
+        track_codecs: dict[str, Codec] | None = None,
         name: str = "cuckoo",
         hub: media.Hub | None = None,
         images: snapshots.Store | None = None,
@@ -97,6 +98,7 @@ class Controller:
         self.control_port = control_port
         self.ingest_port = ingest_port
         self.tracks = tracks or ["video1"]
+        self.track_codecs = track_codecs or {}
         self.name = name
         self.hub = hub
         self.images = images
@@ -183,6 +185,7 @@ class Controller:
         camera.firmware = upgrade.camera_firmware or camera.firmware
         if not camera.tracks:
             camera.tracks = adoption.track_defaults()
+        adoption.set_track_codecs(camera, self.track_codecs)
 
         session = Session(sock=sock, upgrade=upgrade, camera=camera, traffic=self.on_traffic)
         log.info(
@@ -425,6 +428,32 @@ class Controller:
         if session is None:
             return False
         session.request(ptz.GET_POSITION, ptz.get_position())
+        return True
+
+    def _control_session(self, mac: str) -> Session | None:
+        """The management socket for a camera — where settings changes go (not PTZ)."""
+        for session in self._sessions.values():
+            if session.camera.mac == mac and not session.is_ptz_channel:
+                return session
+        return None
+
+    def set_codec(self, mac: str, token: str, codec: Codec) -> bool:
+        """Re-arm one channel with a new codec, live, via a fresh ChangeVideoSettings.
+
+        The same path adoption uses. The choice is remembered (`track_codecs`) so a
+        camera that reconnects comes back up on the codec last asked for.
+        """
+        session = self._control_session(mac)
+        camera = self.cameras.get(mac)
+        if session is None or camera is None or camera.track(token) is None:
+            return False
+        adoption.set_track_codecs(camera, {token: codec})
+        self.track_codecs[token] = codec
+        if token not in self.tracks:
+            self.tracks.append(token)
+        payload = adoption.video_settings(camera, self.ingest_host, self.ingest_port, [token])
+        session.request(adoption.CHANGE_VIDEO, payload)
+        log.info("re-armed %s as %s", token, codec.value)
         return True
 
     def snapshot(self, mac: str, timeout: float = 10.0) -> bytes | None:

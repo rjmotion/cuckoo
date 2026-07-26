@@ -65,6 +65,11 @@ DETECTION_TOPICS: Final[dict[str, tuple[str, str]]] = {
 
 log = logging.getLogger("cuckoo.onvif")
 
+# ONVIF encoding names -> the codec strings the controller arms with.
+ENCODING_TO_CODEC: dict[str, str] = {
+    "H264": "h264", "H265": "h265", "HEVC": "h265", "JPEG": "mjpg", "MJPEG": "mjpg"
+}
+
 
 @dataclass
 class Backend:
@@ -80,6 +85,8 @@ class Backend:
     set_preset: Callable[[str, int | None], int | None] = lambda _n, _i: None
     remove_preset: Callable[[int], bool] = lambda _i: False
     refresh_position: Callable[[], bool] = lambda: False
+    # Re-arm a channel's codec live: (profile/config token, codec "h264"/"h265").
+    set_encoder: Callable[[str, str], bool] = lambda _t, _c: False
 
 
 # ------------------------------------------------------------------------ events
@@ -471,6 +478,26 @@ class Services:
             f"<trt:GetVideoEncoderConfigurationsResponse>{body}"
             "</trt:GetVideoEncoderConfigurationsResponse>"
         )
+
+    def _set_video_encoder_configuration(self, call: Call) -> str:
+        """Re-arm a channel's codec on the fly (ONVIF SetVideoEncoderConfiguration).
+
+        Home Assistant never calls this — it consumes the profiles it is given — but
+        a fuller ONVIF client can flip a channel between H.264 and H.265 at runtime,
+        and it rides the same adoption-time settings path (a fresh ChangeVideoSettings
+        to the camera). The token is the channel (video1/…); Encoding is H264/H265.
+        """
+        camera = self.backend.camera()
+        token = call.attribute("Configuration", "token") or call.text("ConfigurationToken")
+        encoding = call.text("Encoding")
+        if camera is None or not token or camera.track(token) is None:
+            return fault("no such video encoder configuration")
+        codec = ENCODING_TO_CODEC.get(encoding.upper())
+        if codec is None:
+            return fault(f"unsupported encoding {encoding!r}")
+        if not self.backend.set_encoder(token, codec):
+            return fault("could not apply video encoder configuration")
+        return envelope("<trt:SetVideoEncoderConfigurationResponse/>")
 
     def _get_stream_uri(self, call: Call) -> str:
         token = call.text("ProfileToken") or "video1"

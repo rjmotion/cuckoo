@@ -18,11 +18,15 @@ invented. No SSH, no shelling into the camera, no patched firmware.
 ## Verified against real hardware
 
 cuckoo has driven a physical UVC G5 PTZ end to end: adoption, the settings suite,
-PTZ, and **H.265 video re-served as RTSP** (`ffprobe` reads `hevc / Main /
-2688×1512 / 30 fps` + AAC, and a full frame decodes). Its ONVIF face was checked
-by **Home Assistant's own client** (`python-onvif-zeep`), which walked the full
-onboarding — profiles, stream URI, snapshot, the complete PTZ move-and-preset set —
-against both the real camera and finch. See [`harness/`](harness).
+PTZ, and **all three encoder channels re-served as RTSP at once** — `ffprobe` reads
+**`h264 / Main`** at `2688×1512`, `1280×720` and `640×360`, all decoding cleanly
+with AAC, from the one camera. (The camera runs the 4MP H.264 at ~8 Mbps of its own
+accord, and mixed codecs work too — pin a channel to `h265` and it streams
+alongside the H.264 ones.) Its ONVIF face was checked by **Home Assistant's own
+client**
+(`python-onvif-zeep`), which walked the full onboarding — profiles, stream URI,
+snapshot, the complete PTZ move-and-preset set — against both the real camera and
+finch. See [`harness/`](harness).
 
 ## What it does
 
@@ -30,7 +34,8 @@ against both the real camera and finch. See [`harness/`](harness).
    camera                          cuckoo                        clients
   ────────                        ────────                      ─────────
   dials :7442  ──── control ────▶  adoption, settings, PTZ
-  pushes H.265 ──── :7550   ────▶  deframe, republish  ────────▶ RTSP :8554
+  pushes video ──── :7550   ────▶  deframe, republish  ────────▶ RTSP :8554
+  (H.264+H.265)                    (two tracks)         ────────▶ (both ONVIF profiles)
   POSTs JPEG   ──── :7444   ────▶  snapshot store      ────────▶ HTTP snapshot
   Event*       ──── control ────▶  detections          ────────▶ ONVIF events
                                    device model        ────────▶ ONVIF :8000
@@ -83,6 +88,41 @@ certificate is generated on first run (`cuckoo.pem`, mode 600, gitignored). Ever
 port can be moved (`--ingest-port`, `--snapshot-port`, `--rtsp-port`,
 `--onvif-port`).
 
+## Configuration — file or flags
+
+Everything can come from a JSON file, a flag, or both. cuckoo reads `cuckoo.json`
+(or `--config PATH`) as the baseline; **a flag always overrides the file**, and a
+missing file just means defaults + flags. So the same run is expressible either way:
+
+```jsonc
+// cuckoo.json
+{
+  "host": "192.168.1.10",
+  "tracks": { "video1": "h264", "video2": "h265", "video3": "h264" },
+  "ports": { "onvif": 8000, "rtsp": 8554 }
+}
+```
+
+```sh
+./run.sh --config cuckoo.json                       # all from the file
+./run.sh --config cuckoo.json --tracks video1:h265  # …but this run's main is H.265
+```
+
+`tracks` is `{channel: codec}` across the camera's three encoder channels
+(2688×1512, 1280×720, 640×360). **The default codec is H.264** — the one an ONVIF
+client (Home Assistant) needs — so a bare `--tracks video1,video2` or an empty
+config still yields H.264; set any channel to `h265` for an efficient stream. A file
+that names one channel re-codecs only it. The old cuckoo's SSH/credential fields are
+gone (this cuckoo never touches the camera over SSH); see `config.py` for the full
+field map.
+
+### Changing a codec at runtime
+
+A codec can also be flipped live over ONVIF `SetVideoEncoderConfiguration` — set a
+profile's `Encoding` to `H264` or `H265` and cuckoo re-arms that channel on the
+camera through the same settings path, no restart. (Home Assistant never calls this
+— it consumes the profiles you advertise — but a VMS or ONVIF Device Manager can.)
+
 ## Testing without a camera
 
 `./test.sh` runs the lot — nothing needs hardware.
@@ -102,7 +142,8 @@ port can be moved (`--ingest-port`, `--snapshot-port`, `--rtsp-port`,
 
 ### Playing real video through it
 
-`stubcam.py` pushes a real HEVC file at the ingest port the way a camera would:
+`stubcam.py` pushes a real HEVC **or H.264** file at the ingest port the way a
+camera would:
 
 ```sh
 ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=15 -t 4 -c:v libx265 \
@@ -110,6 +151,12 @@ ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=15 -t 4 -c:v libx265 \
 ./run.sh --host 127.0.0.1 &
 python3 stubcam.py /tmp/t.h265 --port 7550 --name video1 --loop
 ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:8554/video1     # -> hevc 1280x720
+
+# The H.264 profile HA needs, exercised the same way with no camera:
+ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=15 -t 4 -c:v libx264 \
+       -x264-params keyint=15 -bsf:v h264_mp4toannexb -f h264 /tmp/t.h264
+python3 stubcam.py /tmp/t.h264 --codec h264 --port 7550 --name video2 --loop
+ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:8554/video2     # -> h264  1280x720
 ```
 
 ### A real ONVIF client — the acceptance test
@@ -148,6 +195,24 @@ the header of `handoff.sh` for the full set of `CUCKOO_*` overrides.
   container with 20 bytes between tags where FLV has 4. The real camera's sequence
   header is not a standard `hvcC` either — it length-prefixes the parameter sets
   and signals config by the FLV frame type, not the packet-type byte.
+- **Home Assistant's ONVIF integration requires an H.264 profile** and rejects an
+  H.265-only device with *"no H.264 streams available"* — and it does **not**
+  reconfigure the encoder to get one (it consumes the profiles you advertise). The
+  camera has **three hardware encoder channels** (2688×1512, 1280×720, 640×360) and
+  encodes `h264`/`h265`/`mjpg` natively. `--tracks` sets the codec per channel; the
+  default `video1:h264,video2:h265,video3:h264` offers **both codecs** — full-res
+  H.264 and a low H.264 so an ONVIF client always finds one, plus an H.265 substream
+  for players that prefer it. Nothing is fixed to one codec; set any channel to
+  either (`--tracks video1:h265,video2:h264,…`). The codec is armed once at
+  adoption, not per client request. No transcode:
+  the H.264 is re-packetised straight through as RFC 6184 RTP the way the HEVC is as
+  RFC 7798. The codec of each stream is read from the wire, not assumed — including
+  the trap that the two codecs signal their config *differently*: HEVC by FLV frame
+  type 6 (packet-type byte 1 even on config), H.264 the standard way (frame type 1,
+  `AVCPacketType` 0, a normal `avcC`). Both are handled; assuming they match loses
+  one codec's parameter sets silently. Verified against the real camera streaming
+  all three channels as H.264 at once (2688×1512, 1280×720, 640×360), and mixed
+  codecs (an H.265 channel alongside H.264 ones) too.
 - **The audio is AAC-LC at 16 kHz mono**, so the SDP states a 16000 clock rate; a
   receiver assuming 44.1 kHz plays it at the wrong speed.
 - **timeSync is a ping-pong.** The camera pings it repeatedly, each message

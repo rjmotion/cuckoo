@@ -7,7 +7,9 @@ following the URI in a media profile.
 Two things about this stream are not what a receiver would assume, and both are
 handled here rather than left to the client:
 
-* the video is **HEVC**, packetised per RFC 7798 (single NAL, or FU fragments)
+* the video is **HEVC or H.264** — whichever the track carries — packetised per
+  RFC 7798 / RFC 6184 (single NAL, or FU fragments). The codec is chosen per stream
+  by its `VideoFormat` (see `videofmt`), so nothing here branches on it directly.
 * the audio is **AAC-LC at 16 kHz mono**, so the RTP clock rate is 16000
 
 Parameter sets go out in the SDP *and* ahead of every keyframe, so a client that
@@ -19,7 +21,6 @@ a busy network and what `-rtsp_transport tcp` selects.
 
 from __future__ import annotations
 
-import base64
 import logging
 import random
 import socket
@@ -29,8 +30,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Final, Iterator
 
-from unifiwire import hevc
 import media
+import videofmt
 
 RTSP_PORT: Final = 8554
 VIDEO_PAYLOAD_TYPE: Final = 96
@@ -38,15 +39,10 @@ AUDIO_PAYLOAD_TYPE: Final = 97
 VIDEO_CLOCK: Final = 90_000
 MTU_PAYLOAD: Final = 1400
 
-FU_TYPE: Final = 49  # RFC 7798 fragmentation unit
 VIDEO_TRACK: Final = 0
 AUDIO_TRACK: Final = 1
 
 log = logging.getLogger("cuckoo.rtsp")
-
-
-def _b64(data: bytes) -> str:
-    return base64.b64encode(data).decode()
 
 
 def sdp(host: str, name: str, stream: media.Stream) -> str:
@@ -59,9 +55,8 @@ def sdp(host: str, name: str, stream: media.Stream) -> str:
         "t=0 0",
         "a=control:*",
         f"m=video 0 RTP/AVP {VIDEO_PAYLOAD_TYPE}",
-        f"a=rtpmap:{VIDEO_PAYLOAD_TYPE} H265/{VIDEO_CLOCK}",
-        f"a=fmtp:{VIDEO_PAYLOAD_TYPE} sprop-vps={_b64(stream.parameters.vps)};"
-        f"sprop-sps={_b64(stream.parameters.sps)};sprop-pps={_b64(stream.parameters.pps)}",
+        f"a=rtpmap:{VIDEO_PAYLOAD_TYPE} {stream.fmt.rtpmap}/{VIDEO_CLOCK}",
+        stream.fmt.fmtp(VIDEO_PAYLOAD_TYPE, stream.parameters),
         f"a=control:trackID={VIDEO_TRACK}",
     ]
     audio = stream.audio
@@ -100,24 +95,40 @@ class Packetiser:
         timestamp = int(timestamp_ms * self.clock / 1000)
         return rtp_header(self.payload_type, self.sequence, timestamp, self.ssrc, marker) + payload
 
-    def video(self, frame: media.VideoFrame, parameters: hevc.ParameterSets) -> Iterator[bytes]:
+    def video(
+        self,
+        frame: media.VideoFrame,
+        parameters: videofmt.VideoParameters,
+        fmt: videofmt.VideoFormat,
+    ) -> Iterator[bytes]:
         units = list(frame.units)
         if frame.keyframe and parameters.complete:
             # Repeat the sets in band: a client that joined mid-stream can start.
-            units = [parameters.vps, parameters.sps, parameters.pps] + units
+            units = list(parameters.sets) + units
         for index, unit in enumerate(units):
             last = index == len(units) - 1
             if len(unit) <= MTU_PAYLOAD:
                 yield self._next(frame.timestamp, unit, marker=last)
                 continue
-            yield from self._fragments(frame.timestamp, unit, final_unit=last)
+            yield from self._fragments(frame.timestamp, unit, fmt, final_unit=last)
 
-    def _fragments(self, timestamp_ms: int, unit: bytes, final_unit: bool) -> Iterator[bytes]:
-        """RFC 7798 FU: the two-byte payload header, then S/E/type per fragment."""
-        kind = hevc.nal_type(unit) or 0
-        header = bytes([(FU_TYPE << 1) | (unit[0] & 0x81), unit[1]])
-        body = unit[2:]
-        chunk = MTU_PAYLOAD - 3
+    def _fragments(
+        self, timestamp_ms: int, unit: bytes, fmt: videofmt.VideoFormat, final_unit: bool
+    ) -> Iterator[bytes]:
+        """A fragmentation unit: the codec's payload header, then S/E/type per fragment.
+
+        RFC 7798 (HEVC) uses a two-byte FU header; RFC 6184 (H.264) a one-byte one.
+        Both then carry a start/end/type byte on every fragment and the NAL body
+        with its header stripped.
+        """
+        if fmt.nal_header_len == 2:  # HEVC — RFC 7798
+            kind = (unit[0] >> 1) & 0x3F
+            header = bytes([(fmt.fu_type << 1) | (unit[0] & 0x81), unit[1]])
+        else:  # H.264 — RFC 6184 FU-A: keep F and NRI, replace type with 28
+            kind = unit[0] & 0x1F
+            header = bytes([(unit[0] & 0xE0) | fmt.fu_type])
+        body = unit[fmt.nal_header_len :]
+        chunk = MTU_PAYLOAD - (len(header) + 1)
         offsets = range(0, len(body), chunk)
         for index, at in enumerate(offsets):
             start = index == 0
@@ -413,7 +424,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 continue
             packetiser = session.packetiser(track)
             if isinstance(frame, media.VideoFrame):
-                packets = packetiser.video(frame, session.stream.parameters)
+                packets = packetiser.video(frame, session.stream.parameters, session.stream.fmt)
             else:
                 packets = packetiser.audio(frame)
             try:

@@ -24,6 +24,7 @@ from typing import Final, Iterator
 
 from unifiwire import flv
 from unifiwire import hevc
+import videofmt
 
 INGEST_PORT: Final = 7550
 MJPEG_PORT: Final = 7551
@@ -83,7 +84,8 @@ class Stream:
 
     name: str
     codec_id: int | None = None
-    parameters: hevc.ParameterSets = field(default_factory=hevc.ParameterSets)
+    fmt: videofmt.VideoFormat = videofmt.H265
+    parameters: videofmt.VideoParameters = field(default_factory=hevc.ParameterSets)
     audio_specific_config: bytes = b""
     frames: int = 0
     keyframes: int = 0
@@ -137,25 +139,38 @@ class Stream:
 
     def _accept_video(self, tag: flv.Tag) -> Frame | None:
         self.codec_id = tag.codec_id
-        # The sequence header is marked by the FLV frame type, not the packet-type
-        # byte: a real camera sets that byte to 1 even on config, so keying on it
-        # (as the AVC/FLV convention says) misses the parameter sets entirely.
-        if tag.is_sequence_header:
-            parameters = hevc.parameter_sets(tag.body)
+        if tag.codec_id is not None:
+            self.fmt = videofmt.for_codec_id(tag.codec_id)
+        packet = hevc.video_packet(tag.body)
+        # Config arrives two different ways on this wire. HEVC marks it with FLV
+        # frame type 6 and sets the AVCPacketType byte to 1 even on config; H.264
+        # uses the standard convention — frame type 1 (a keyframe) with the
+        # AVCPacketType byte 0 and an `avcC` record. Accept either so both codecs'
+        # parameter sets are found.
+        if tag.is_sequence_header or (packet is not None and packet.is_config):
+            parameters = self.fmt.parse(tag.body)
             if parameters.complete:
                 self.parameters = parameters
-                log.info("%s: parameter sets received, stream is playable", self.name)
+                log.info("%s: %s parameter sets received, stream is playable",
+                         self.name, self.fmt.rtpmap)
             return None
-        packet = hevc.video_packet(tag.body)
         if packet is None:
             return None
         units = list(hevc.split_nalus(packet.payload, self.parameters.length_size))
         if not units:
             return None
+        if not self.parameters.complete:
+            # Some cameras also repeat the sets in band ahead of a keyframe rather
+            # than in a config tag; recover them from the units when they do.
+            recovered = self.fmt.collect(units, self.parameters.length_size)
+            if recovered.complete:
+                self.parameters = recovered
+                log.info("%s: %s parameter sets recovered in band, stream is playable",
+                         self.name, self.fmt.rtpmap)
         frame = VideoFrame(
             timestamp=tag.timestamp,
             units=units,
-            keyframe=tag.is_keyframe or any(hevc.is_irap(u) for u in units),
+            keyframe=tag.is_keyframe or any(self.fmt.is_keyframe(u) for u in units),
         )
         self.frames += 1
         if frame.keyframe:

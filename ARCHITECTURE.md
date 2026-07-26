@@ -58,9 +58,12 @@ the model is four axes. Position is both polled (`GetCurrentPosition`) and pushe
 
 **Media** is pushed, not pulled. Arming a track with a `destinations` address makes
 the camera dial it and write `extendedFlv` — FLV with 20 bytes between tags instead
-of 4, HEVC under codec id 8, AAC-LC 16 kHz. The sequence header is not a standard
-`hvcC`; the parameter sets are length-prefixed and config is signalled by the FLV
-frame type. `flv`/`hevc`/`annexb` in
+of 4, HEVC under codec id 8 (or H.264 under id 7), AAC-LC 16 kHz. The sequence
+header is not a standard `hvcC`/`avcC`; the parameter sets are length-prefixed and
+config is signalled by the FLV frame type. Each track carries the codec it was
+armed for — the camera encodes `h264`/`h265`/`mjpg` natively — so cuckoo arms one
+H.265 track and one H.264 track, because Home Assistant's ONVIF integration requires
+an H.264 profile. `flv`/`hevc`/`avc`/`annexb` in
 [`pyunifiwire`](https://github.com/rjmotion/pyunifiwire) handle all of this.
 
 **Snapshots** are pushed too: the controller sends `GetRequest` with a one-time
@@ -75,7 +78,9 @@ controller to release it, and `manage.py` POSTs `/api/1.2/manage` to point it he
 
 The adopted `Camera` model is rendered as ONVIF: Device, Media, PTZ, Events and
 Imaging over SOAP; WS-Discovery so clients find it; and an RTSP server that
-re-packetises the pushed H.265/AAC as standard RTP. PTZ maps the ONVIF move and
+re-packetises the pushed H.265 or H.264 (RFC 7798 / RFC 6184) and AAC as standard
+RTP — one media profile per armed track, so a client picks the codec it wants. PTZ
+maps the ONVIF move and
 preset operations onto the `ptz1` channel — normalised −1..1 coordinates in, motor
 units out, clamped to the camera's own announced ranges.
 

@@ -16,14 +16,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 from typing import Final
 
+import config
 from unifiwire import certs
 import discovery
 import events
@@ -33,7 +35,7 @@ import rtsp
 import snapshots
 from controller import CONTROL_PORT, Controller
 from unifiwire.envelope import Envelope
-from model import Camera, Position
+from model import Camera, Codec, Position
 
 DEFAULT_CERT: Final = "cuckoo.pem"
 SNAPSHOT_WAIT_SEC: Final = 10.0
@@ -49,6 +51,7 @@ class Options:
     cert: Path = Path(DEFAULT_CERT)
     name: str = "cuckoo"
     tracks: tuple[str, ...] = ("video1",)
+    track_codecs: dict[str, Codec] = field(default_factory=dict)
     control_port: int = CONTROL_PORT
     ingest_port: int = media.INGEST_PORT
     snapshot_port: int = snapshots.SNAPSHOT_PORT
@@ -95,6 +98,88 @@ class Stack:
         self.controller.serve_forever()
 
 
+def spec_to_tracks(spec: str) -> dict[str, str]:
+    """Parse a `--tracks` value into `{channel: codec}`.
+
+    Each entry is `name` or `name:codec`, e.g. `video1:h264,video2:h265`. A bare
+    name defaults to h264 — the codec an ONVIF client needs — so `--tracks video1`
+    arms one H.264 channel. This is the same shape as the config file's `tracks`
+    object, so the two are interchangeable and the CLI simply replaces it.
+    """
+    out: dict[str, str] = {}
+    for entry in spec.split(","):
+        entry = entry.strip()
+        if entry:
+            name, _, codec = entry.partition(":")
+            out[name] = codec or "h264"
+    return out
+
+
+def tracks_to_model(tracks: dict[str, str]) -> tuple[tuple[str, ...], dict[str, Codec]]:
+    """Turn a `{channel: codec}` map into the arm order and typed codecs."""
+    names: list[str] = []
+    codecs: dict[str, Codec] = {}
+    for name, codec in tracks.items():
+        names.append(name)
+        try:
+            codecs[name] = Codec(codec)
+        except ValueError:
+            log.warning("unknown codec %r for track %s; using h264", codec, name)
+            codecs[name] = Codec.H264
+    return tuple(names), codecs
+
+
+def resolve_options(args: argparse.Namespace) -> Options:
+    """Merge config file, then CLI, into the Options the stack runs on.
+
+    Precedence is defaults < config file < CLI flag. A flag left unset (None) does
+    not override the file; a flag given always wins. A missing default config file
+    is fine, but a `--config PATH` that does not exist is an error.
+    """
+    path = args.config or config.DEFAULT_CONFIG_PATH
+    if args.config and not os.path.exists(path):
+        raise SystemExit(f"config file not found: {path}")
+    effective = config.merged(config.load(path))
+
+    if args.host is not None:
+        effective["host"] = args.host
+    if args.name is not None:
+        effective["name"] = args.name
+    if args.cert is not None:
+        effective["cert"] = str(args.cert)
+    if args.no_announce:
+        effective["announce"] = False
+    if args.tracks is not None:
+        effective["tracks"] = spec_to_tracks(args.tracks)
+    ports = effective["ports"]
+    for flag, key in (
+        (args.control_port, "control"), (args.ingest_port, "ingest"),
+        (args.snapshot_port, "snapshot"), (args.rtsp_port, "rtsp"),
+        (args.onvif_port, "onvif"), (args.discovery_port, "discovery"),
+    ):
+        if flag is not None:
+            ports[key] = flag
+
+    if not effective["host"]:
+        raise SystemExit('no host set — pass --host or set "host" in the config file')
+    names, codecs = tracks_to_model(effective["tracks"])
+    return Options(
+        host=effective["host"],
+        cert=Path(effective["cert"]),
+        name=effective["name"],
+        tracks=names,
+        track_codecs=codecs,
+        control_port=ports["control"],
+        ingest_port=ports["ingest"],
+        snapshot_port=ports["snapshot"],
+        rtsp_port=ports["rtsp"],
+        onvif_port=ports["onvif"],
+        discovery_port=ports["discovery"],
+        announce=effective["announce"],
+        dump=args.dump,
+    )
+
+
 def build(options: Options) -> Stack:
     certs.ensure(options.cert, common_name=options.name)
 
@@ -118,6 +203,7 @@ def build(options: Options) -> Stack:
         control_port=options.control_port,
         ingest_port=ingest_port,
         tracks=list(options.tracks),
+        track_codecs=options.track_codecs,
         name=options.name,
         hub=hub,
         images=images,
@@ -153,6 +239,15 @@ def build(options: Options) -> Stack:
         mac = mac_of()
         return control.poll_position(mac) if mac else False
 
+    def set_encoder(token: str, codec: str) -> bool:
+        mac = mac_of()
+        if mac is None:
+            return False
+        try:
+            return control.set_codec(mac, token, Codec(codec))
+        except ValueError:
+            return False
+
     def snapshot() -> bytes | None:
         """Ask for a fresh image; fall back to the last one if the camera is slow."""
         mac = mac_of()
@@ -174,6 +269,7 @@ def build(options: Options) -> Stack:
         set_preset=set_preset,
         remove_preset=remove_preset,
         refresh_position=refresh_position,
+        set_encoder=set_encoder,
     )
     services = onvif.Services(backend, host=options.host, port=options.onvif_port)
     north = onvif.OnvifServer(services, port=options.onvif_port)
@@ -241,15 +337,24 @@ def build(options: Options) -> Stack:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Present a UniFi camera as an ONVIF device.")
-    parser.add_argument("--host", required=True, help="address the camera and clients reach us on")
-    parser.add_argument("--control-port", type=int, default=CONTROL_PORT)
-    parser.add_argument("--ingest-port", type=int, default=media.INGEST_PORT)
-    parser.add_argument("--snapshot-port", type=int, default=snapshots.SNAPSHOT_PORT)
-    parser.add_argument("--rtsp-port", type=int, default=rtsp.RTSP_PORT)
-    parser.add_argument("--onvif-port", type=int, default=onvif.ONVIF_PORT)
-    parser.add_argument("--cert", type=Path, default=Path(DEFAULT_CERT))
-    parser.add_argument("--tracks", default="video1", help="comma-separated track names to arm")
-    parser.add_argument("--name", default="cuckoo", help="controller name shown to the camera")
+    # Overridable settings default to None so the config file shows through when a
+    # flag is omitted; a flag that is given always wins. See resolve_options().
+    parser.add_argument("--config", default=None,
+                        help=f"JSON config file (default {config.DEFAULT_CONFIG_PATH} if present)")
+    parser.add_argument("--host", default=None, help="address the camera and clients reach us on")
+    parser.add_argument("--control-port", type=int, default=None)
+    parser.add_argument("--ingest-port", type=int, default=None)
+    parser.add_argument("--snapshot-port", type=int, default=None)
+    parser.add_argument("--rtsp-port", type=int, default=None)
+    parser.add_argument("--onvif-port", type=int, default=None)
+    parser.add_argument("--discovery-port", type=int, default=None)
+    parser.add_argument("--cert", type=Path, default=None)
+    parser.add_argument(
+        "--tracks", default=None,
+        help="comma-separated tracks to arm, each name[:codec] (bare name = h264). "
+        "Overrides the config file's tracks. Default: h264 on video1/video2/video3.",
+    )
+    parser.add_argument("--name", default=None, help="controller name shown to the camera")
     parser.add_argument(
         "--no-announce", action="store_true", help="answer discovery probes but do not multicast"
     )
@@ -267,19 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
     )
 
-    options = Options(
-        host=args.host,
-        cert=args.cert,
-        name=args.name,
-        tracks=tuple(t for t in args.tracks.split(",") if t),
-        control_port=args.control_port,
-        ingest_port=args.ingest_port,
-        snapshot_port=args.snapshot_port,
-        rtsp_port=args.rtsp_port,
-        onvif_port=args.onvif_port,
-        announce=not args.no_announce,
-        dump=args.dump,
-    )
+    options = resolve_options(args)
     stack = build(options)
 
     stopping = threading.Event()

@@ -41,7 +41,7 @@ INGEST_PORT="${CUCKOO_INGEST_PORT:-17550}"
 SNAPSHOT_PORT="${CUCKOO_SNAPSHOT_PORT:-17444}"
 RTSP_PORT="${CUCKOO_RTSP_PORT:-8554}"
 ONVIF_PORT="${CUCKOO_ONVIF_PORT:-8000}"
-TRACKS="${CUCKOO_TRACKS:-video1}"
+TRACKS="${CUCKOO_TRACKS:-video1:h264,video2:h265,video3:h264}"  # full-res H.264 + low H.264 for ONVIF, H.265 sub for efficiency; override freely
 SECRETS="${CUCKOO_SECRETS:-$HOME/.cuckoo/secrets}"
 CAMERA_MAC="${CUCKOO_CAMERA_MAC:-}"
 CAMERA_HOST="${CUCKOO_CAMERA_HOST:-}"
@@ -166,7 +166,9 @@ case "${1:-status}" in
     fi
     stop_resident
     trap 'echo; stop_cuckoo; start_resident' EXIT INT TERM
-    ./run.sh --host "$host" --tracks "$TRACKS" \
+    # Only pass --tracks when CUCKOO_TRACKS is set; otherwise defer to cuckoo.json
+    # / the built-in default (all H.264). CLI still wins over the file when set.
+    ./run.sh --host "$host" ${TRACKS:+--tracks "$TRACKS"} \
       --ingest-port "$INGEST_PORT" --snapshot-port "$SNAPSHOT_PORT" \
       --rtsp-port "$RTSP_PORT" --onvif-port "$ONVIF_PORT" \
       --dump "$DUMP" --verbose >"$LOG" 2>&1 &
