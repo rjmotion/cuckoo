@@ -162,6 +162,13 @@ the header of `handoff.sh` for the full set of `CUCKOO_*` overrides.
 - **ONVIF `Capabilities` order is load-bearing.** It is a strict schema sequence
   and a real client drops anything out of order — get it wrong and Home Assistant
   silently adds the camera with no event sensors.
+- **WS-Discovery must use WS-Addressing 2004/08, not 2005/08** — a must-have for
+  autodiscovery. ONVIF pairs the 2005/04 discovery draft with the *2004/08*
+  addressing namespace; a device that uses 2005/08 finds no `MessageID` in the
+  probe, replies to nothing, and never appears in Home Assistant's discovery. The
+  failure is silent and total, and invisible to a self-written probe (which
+  round-trips against its own wrong namespace) — only a real client catches it.
+  See the `discovery.py` docstring and `tests/test_discovery.py`.
 - **No ONVIF authentication yet.** Requests are served unauthenticated. Don't
   expose the ONVIF port to an untrusted network.
 

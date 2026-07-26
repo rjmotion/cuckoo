@@ -6,6 +6,50 @@ client that is already listening notices us without probing.
 
 A Probe that asks for a device type we are not is ignored rather than answered
 wrongly — answering everything makes us appear as devices we cannot serve.
+
+Why this module is not optional
+-------------------------------
+Without correct WS-Discovery a client cannot find the camera **by itself**. A user
+can still add it by typing the address, but Home Assistant's "it just appeared"
+onboarding — the thing that makes an ONVIF camera pleasant to use — depends
+entirely on this. So this is a must-have, not a nicety, and it has a failure mode
+that hides in plain sight (see below).
+
+The one detail everything hinges on: the WS-Addressing namespace
+--------------------------------------------------------------------
+ONVIF's WS-Discovery profile pairs the **2005/04** discovery draft
+(`DISCOVERY_NS`) with **WS-Addressing 2004/08** (`ADDRESSING_NS`,
+`http://schemas.xmlsoap.org/ws/2004/08/addressing`) — *not* the later 2005/08
+addressing spec. A real ONVIF client (Home Assistant uses `python-ws-discovery`)
+sends the Probe's `MessageID` under 2004/08 and expects the `ProbeMatch` back in
+the same namespace.
+
+Get this wrong and the failure is **silent and total**: a device that looks for the
+client's `MessageID` under 2005/08 simply does not find it, sends no reply, and
+never appears in discovery. Nothing errors. It is invisible to a hand-written probe
+that also uses the wrong namespace, because that round-trips against itself just
+fine — only a real client, or a probe captured off the wire, exposes it. (This
+happened here; the fix and the regression test that pins it are below and in
+`tests/test_discovery.py`.)
+
+Two more things a real client does that a naive one does not, both handled here:
+
+* it declares the ONVIF type in `<d:Types>` under a **random namespace prefix**
+  (`xmlns:Zx="…/network/wsdl"` … `<d:Types>Zx:NetworkVideoTransmitter</d:Types>`),
+  so type matching must compare *local* names, never prefixes;
+* it correlates the reply by `RelatesTo` = the Probe's `MessageID`, so the reply
+  must echo it back.
+
+How it works, end to end
+------------------------
+1. `DiscoveryServer` binds :3702, joins the multicast group, and (optionally)
+   multicasts a Hello so already-listening clients see us immediately.
+2. `probe_message_id()` parses an incoming Probe: it must be a Probe, its Types (if
+   any) must name a type we are, and it must carry a MessageID — returned so the
+   reply can relate to it. Anything else returns None and is ignored.
+3. `probe_match()` builds the ProbeMatch — our stable endpoint UUID, our Types and
+   Scopes, the `XAddrs` pointing at our ONVIF device service, and `RelatesTo` set
+   to the Probe's MessageID — and it is unicast straight back to the prober.
 """
 
 from __future__ import annotations

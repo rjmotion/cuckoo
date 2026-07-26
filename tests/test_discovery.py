@@ -133,3 +133,33 @@ def test_a_real_onvif_client_probe_is_answered() -> None:
         "</s:Envelope>"
     ).encode()
     assert discovery.probe_message_id(real) == "urn:uuid:5bb7eebe-18b6-4d63-9aea-5c63ecbff49c"
+
+
+
+def test_the_reply_uses_the_onvif_wsaddressing_namespace() -> None:
+    """The ProbeMatch must come back in WS-Addressing 2004/08 and relate to the
+    probe — a real client validates and correlates on both."""
+    reply = discovery.probe_match(IDENTITY, "urn:uuid:abc")
+    assert "http://schemas.xmlsoap.org/ws/2004/08/addressing" in reply
+    assert "http://www.w3.org/2005/08/addressing" not in reply, "2005/08 is the wrong spec"
+    assert "<a:RelatesTo>urn:uuid:abc</a:RelatesTo>" in reply
+
+
+def test_wsaddressing_namespace_is_the_2004_08_one() -> None:
+    """A blunt guard so nobody 'tidies' this back to 2005/08 and silently breaks
+    autodiscovery again."""
+    assert discovery.ADDRESSING_NS == "http://schemas.xmlsoap.org/ws/2004/08/addressing"
+
+
+def test_a_probe_using_the_wrong_2005_08_namespace_is_still_tolerated() -> None:
+    """We answer in the ONVIF namespace, but accept a client's MessageID under
+    either, rather than dropping it."""
+    legacy = (
+        '<?xml version="1.0" ?>'
+        '<s:Envelope xmlns:a="http://www.w3.org/2005/08/addressing" '
+        'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" '
+        'xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        "<s:Header><a:MessageID>urn:uuid:legacy</a:MessageID></s:Header>"
+        "<s:Body><d:Probe/></s:Body></s:Envelope>"
+    ).encode()
+    assert discovery.probe_message_id(legacy) == "urn:uuid:legacy"
