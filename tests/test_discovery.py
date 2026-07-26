@@ -19,7 +19,8 @@ def probe(types: str | None = discovery.NVT_TYPE, message_id: str = "urn:uuid:ab
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
-        'xmlns:a="http://www.w3.org/2005/08/addressing" '
+        # The 2004/08 WS-Addressing namespace, as real ONVIF clients actually send.
+        'xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
         'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" '
         'xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
         f"<s:Header><a:MessageID>{message_id}</a:MessageID>"
@@ -109,3 +110,26 @@ def test_a_real_probe_over_udp_gets_a_real_answer() -> None:
     finally:
         client.close()
         server.stop()
+
+
+
+def test_a_real_onvif_client_probe_is_answered() -> None:
+    """The exact shape python-ws-discovery (Home Assistant's client) sends: the
+    ONVIF type under a random namespace prefix, and WS-Addressing 2004/08. cuckoo
+    once looked for the MessageID under 2005/08, found nothing, and silently
+    dropped every real probe — so nothing appeared in HA discovery."""
+    real = (
+        '<?xml version="1.0" ?>'
+        '<s:Envelope xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+        'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" '
+        'xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:Zx="http://www.onvif.org/ver10/network/wsdl">'
+        "<s:Header>"
+        "<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action>"
+        "<a:MessageID>urn:uuid:5bb7eebe-18b6-4d63-9aea-5c63ecbff49c</a:MessageID>"
+        "<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>"
+        "</s:Header>"
+        "<s:Body><d:Probe><d:Types>Zx:NetworkVideoTransmitter</d:Types></d:Probe></s:Body>"
+        "</s:Envelope>"
+    ).encode()
+    assert discovery.probe_message_id(real) == "urn:uuid:5bb7eebe-18b6-4d63-9aea-5c63ecbff49c"

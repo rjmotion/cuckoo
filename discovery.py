@@ -23,7 +23,14 @@ WS_DISCOVERY_PORT: Final = 3702
 MULTICAST_GROUP: Final = "239.255.255.250"
 
 DISCOVERY_NS: Final = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
-ADDRESSING_NS: Final = "http://www.w3.org/2005/08/addressing"
+# ONVIF pairs the 2005/04 WS-Discovery draft with the **2004/08** WS-Addressing
+# namespace, and that is what real ONVIF clients (Home Assistant's included) send
+# and expect back. The later 2005/08 addressing namespace is a different spec; a
+# device that answers in it, or looks for the client's MessageID under it, is
+# silently ignored — the probe's MessageID simply is not found, so no reply goes
+# out and the camera never appears in discovery.
+ADDRESSING_NS: Final = "http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ADDRESSING_NS_2005: Final = "http://www.w3.org/2005/08/addressing"
 SOAP_NS: Final = "http://www.w3.org/2003/05/soap-envelope"
 NVT_TYPE: Final = "dn:NetworkVideoTransmitter"
 DEVICE_TYPE: Final = "tds:Device"
@@ -128,7 +135,11 @@ def probe_message_id(payload: bytes) -> str | None:
     header = root.find(f"{{{SOAP_NS}}}Header")
     if header is None:
         return None
+    # Accept the MessageID under either WS-Addressing namespace: ONVIF clients use
+    # 2004/08, but tolerate a client that used 2005/08 rather than dropping it.
     message_id = header.find(f"{{{ADDRESSING_NS}}}MessageID")
+    if message_id is None:
+        message_id = header.find(f"{{{ADDRESSING_NS_2005}}}MessageID")
     if message_id is None or not message_id.text:
         return None
     return message_id.text.strip()
