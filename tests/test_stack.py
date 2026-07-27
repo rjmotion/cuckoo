@@ -219,7 +219,9 @@ def test_ptz_from_the_onvif_side_reaches_the_camera(tmp_path: Path) -> None:
         assert len(presets) >= before + 2, "a move is a config then a go"
         configured = next(m for m in presets if m.payload.get("action") == "config")
         item = configured.payload["items"][0]
-        assert item["pan"] == 500 and item["tilt"] == 18000, "clamped to the camera's own limits"
+        # ONVIF +Y = up and the camera's tilt axis is inverted, so y=1.0 (fully up)
+        # lands on the tilt minimum. Both axes clamp to the camera's own limits.
+        assert item["pan"] == 500 and item["tilt"] == 8000, "clamped to the camera's own limits"
 
         status = soap(
             stack.north.port, onvif.PTZ_PATH, "GetStatus", "http://www.onvif.org/ver20/ptz/wsdl"

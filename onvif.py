@@ -12,6 +12,7 @@ implementation — every verb here is one a real client actually sends.
 
 from __future__ import annotations
 
+import html
 import logging
 import threading
 import time
@@ -49,6 +50,83 @@ NAMESPACES: Final = {
 MANUFACTURER: Final = "cuckoo"
 PTZ_NODE: Final = "PTZNode"
 PTZ_CONFIG: Final = "PTZConfig"
+
+# The generic PTZ spaces, shared verbatim by the node's SupportedPTZSpaces and by
+# GetConfigurationOptions. Home Assistant reads move-mode support from the
+# *ConfigurationOptions* Spaces, not from the node — omit a space there and HA
+# refuses that move mode ("RelativeMove not supported on device …") and the PTZ
+# service silently no-ops. Absolute, Relative and Continuous are all advertised so
+# every mode a client might send (arrow taps, hold-to-pan, presets) resolves; the
+# camera itself has only preset-based motion, so each resolves to one relative step.
+PTZ_SPACES: Final = (
+    "<tt:AbsolutePanTiltPositionSpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace</tt:URI>"
+    "<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>"
+    "</tt:AbsolutePanTiltPositionSpace>"
+    "<tt:AbsoluteZoomPositionSpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace</tt:URI>"
+    "<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "</tt:AbsoluteZoomPositionSpace>"
+    "<tt:RelativePanTiltTranslationSpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationGenericSpace</tt:URI>"
+    "<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>"
+    "</tt:RelativePanTiltTranslationSpace>"
+    "<tt:RelativeZoomTranslationSpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/TranslationGenericSpace</tt:URI>"
+    "<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "</tt:RelativeZoomTranslationSpace>"
+    "<tt:ContinuousPanTiltVelocitySpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>"
+    "<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>"
+    "</tt:ContinuousPanTiltVelocitySpace>"
+    "<tt:ContinuousZoomVelocitySpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace</tt:URI>"
+    "<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "</tt:ContinuousZoomVelocitySpace>"
+    "<tt:PanTiltSpeedSpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/GenericSpeedSpace</tt:URI>"
+    "<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "</tt:PanTiltSpeedSpace>"
+    "<tt:ZoomSpeedSpace>"
+    "<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomGenericSpeedSpace</tt:URI>"
+    "<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
+    "</tt:ZoomSpeedSpace>"
+)
+
+# The Default*Space elements inside a PTZConfiguration. Home Assistant reads
+# move-mode support ENTIRELY from these, off GetProfiles: relative from
+# DefaultRelativePanTiltTranslationSpace, continuous from
+# DefaultContinuousPanTiltVelocitySpace, absolute from
+# DefaultAbsolutePantTiltPositionSpace. Emit only the absolute pair (as cuckoo
+# first did) and HA marks the camera PTZ-capable but logs "RelativeMove not
+# supported" and no-ops every relative/continuous move. Order matters — zeep
+# validates the schema sequence and silently drops anything out of order. The
+# "Pant" in DefaultAbsolutePantTiltPositionSpace is the ONVIF spec's own typo,
+# which HA matches verbatim; keep it.
+PTZ_DEFAULT_SPACES: Final = (
+    "<tt:DefaultAbsolutePantTiltPositionSpace>"
+    "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"
+    "</tt:DefaultAbsolutePantTiltPositionSpace>"
+    "<tt:DefaultAbsoluteZoomPositionSpace>"
+    "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"
+    "</tt:DefaultAbsoluteZoomPositionSpace>"
+    "<tt:DefaultRelativePanTiltTranslationSpace>"
+    "http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationGenericSpace"
+    "</tt:DefaultRelativePanTiltTranslationSpace>"
+    "<tt:DefaultRelativeZoomTranslationSpace>"
+    "http://www.onvif.org/ver10/tptz/ZoomSpaces/TranslationGenericSpace"
+    "</tt:DefaultRelativeZoomTranslationSpace>"
+    "<tt:DefaultContinuousPanTiltVelocitySpace>"
+    "http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace"
+    "</tt:DefaultContinuousPanTiltVelocitySpace>"
+    "<tt:DefaultContinuousZoomVelocitySpace>"
+    "http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace"
+    "</tt:DefaultContinuousZoomVelocitySpace>"
+    "<tt:DefaultPTZTimeout>PT60S</tt:DefaultPTZTimeout>"
+)
 MOTION_TOPIC: Final = "tns1:RuleEngine/CellMotionDetector/Motion"
 OBJECT_TOPIC: Final = "tns1:RuleEngine/MyRuleDetector"
 AUDIO_TOPIC: Final = "tns1:AudioAnalytics/Audio/DetectedSound"
@@ -283,6 +361,122 @@ class Services:
     def address(self, path: str) -> str:
         return f"http://{self.host}:{self.port}{path}"
 
+    # ------------------------------------------------------------- telemetry
+
+    def status_page(self) -> str:
+        """A human-facing status page served at GET / on the ONVIF port.
+
+        Everything shown is read from live controller state — the adopted camera,
+        its tracks and codecs, the last known PTZ position (ONVIF convention and
+        raw motor units), presets, and the endpoints a client would point at.
+        """
+        camera = self.backend.camera()
+        up = int(time.time() - self.started_at)
+        uptime = f"{up // 3600}h {up % 3600 // 60:02d}m {up % 60:02d}s"
+
+        def esc(value: object) -> str:
+            return html.escape(str(value))
+
+        def rows(*pairs: tuple[str, str]) -> str:
+            return "".join(f"<tr><th>{esc(k)}</th><td>{v}</td></tr>" for k, v in pairs)
+
+        if camera is None:
+            body = "<section><h2>Camera</h2><p class='warn'>No camera adopted yet.</p></section>"
+        else:
+            pos = camera.motion.position
+            pan = camera.pan_range.to_normalised(pos.pan)
+            tilt = -camera.tilt_range.to_normalised(pos.tilt)  # ONVIF +Y = up
+            zoom = (camera.zoom_range.to_normalised(pos.zoom) + 1.0) / 2.0
+            cam = rows(
+                ("MAC", esc(camera.mac)),
+                ("Model", esc(camera.model or "—")),
+                ("Firmware", esc(camera.firmware or "—")),
+                ("PTZ", "yes" if camera.is_ptz else "no"),
+                ("Motion", "moving" if not camera.motion.settled else "idle"),
+                ("Audio", esc(", ".join(c.value for c in camera.audio_codecs) or "—")),
+            )
+            if camera.is_ptz:
+                cam += rows(
+                    ("Position (ONVIF)", f"pan {pan:+.3f} · tilt {tilt:+.3f} · zoom {zoom:.3f}"),
+                    ("Position (motor)", f"pan {pos.pan} · tilt {pos.tilt} · zoom {pos.zoom} · focus {pos.focus}"),
+                    ("Pan range", f"{camera.pan_range.minimum}‥{camera.pan_range.maximum}"),
+                    ("Tilt range", f"{camera.tilt_range.minimum}‥{camera.tilt_range.maximum}"),
+                )
+
+            track_rows = "".join(
+                f"<tr><td>{esc(t.name)}</td><td>{t.width}×{t.height}</td>"
+                f"<td>{esc(t.codec.value)}</td>"
+                f"<td class='mono'>{esc(self.backend.stream_uri(t.name))}</td></tr>"
+                for t in camera.tracks
+            )
+            tracks = (
+                "<section class='span'><h2>Streams</h2><table class='wide'>"
+                "<tr><th>Track</th><th>Resolution</th><th>Codec</th><th>RTSP URI</th></tr>"
+                f"{track_rows}</table></section>"
+            )
+
+            if camera.presets:
+                preset_rows = "".join(
+                    f"<tr><td>{i}</td><td>{esc(p.name)}</td></tr>"
+                    for i, p in sorted(camera.presets.items())
+                )
+                presets = f"<section><h2>Presets</h2><table>{preset_rows}</table></section>"
+            else:
+                presets = "<section><h2>Presets</h2><p>None set.</p></section>"
+
+            endpoints = "<section><h2>Endpoints</h2><table>" + rows(
+                ("ONVIF", f"<span class='mono'>{esc(self.address(DEVICE_PATH))}</span>"),
+                ("Snapshot", f"<span class='mono'>{esc(self.address(SNAPSHOT_PATH))}</span>"),
+            ) + "</table></section>"
+
+            body = (
+                f"<section><h2>Camera</h2><table>{cam}</table></section>"
+                f"<section><h2>Live</h2><img src='{SNAPSHOT_PATH}' alt='snapshot' "
+                "onerror=\"this.style.display='none'\"></section>"
+                f"{tracks}{presets}{endpoints}"
+            )
+
+        state = "adopted" if camera else "waiting"
+        badge = "ok" if camera else "warn"
+        return (
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<meta http-equiv='refresh' content='5'><title>cuckoo · telemetry</title>"
+            "<style>"
+            ":root{color-scheme:dark}"
+            "body{margin:0;background:#0d1117;color:#c9d1d9;"
+            "font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}"
+            "header{display:flex;align-items:center;gap:.6rem;padding:1rem 1.4rem;"
+            "border-bottom:1px solid #21262d}"
+            "h1{margin:0;font-size:1.3rem;letter-spacing:.5px}"
+            "h2{margin:0 0 .5rem;font-size:.8rem;text-transform:uppercase;"
+            "letter-spacing:.08em;color:#8b949e}"
+            ".badge{font-size:.72rem;padding:.15rem .5rem;border-radius:999px;text-transform:uppercase}"
+            ".badge.ok{background:#238636;color:#fff}.badge.warn{background:#9e6a03;color:#fff}"
+            ".meta{padding:.4rem 1.4rem;color:#8b949e;border-bottom:1px solid #21262d;margin:0}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));"
+            "gap:1rem;padding:1.4rem}"
+            "section{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:1rem}"
+            "section.span{grid-column:1/-1}"
+            "table{border-collapse:collapse;width:100%}"
+            "th{text-align:left;color:#8b949e;font-weight:400;padding:.2rem .8rem .2rem 0;"
+            "white-space:nowrap;vertical-align:top}"
+            "td{padding:.2rem 0}"
+            "table.wide th{color:#8b949e;border-bottom:1px solid #21262d;padding-bottom:.4rem}"
+            "table.wide td{padding:.3rem .8rem .3rem 0}"
+            ".mono{font-family:ui-monospace,monospace;color:#79c0ff;word-break:break-all}"
+            ".warn{color:#e3b341}"
+            "img{max-width:100%;border-radius:6px;display:block}"
+            "footer{padding:1rem 1.4rem;color:#484f58;font-size:.75rem}"
+            "</style></head><body>"
+            f"<header><h1>cuckoo</h1><span class='badge {badge}'>{state}</span></header>"
+            f"<p class='meta'>listening on {esc(self.host)}:{self.port} · "
+            f"uptime {uptime} · {self.subscriptions.count} event subscriber(s)</p>"
+            f"<div class='grid'>{body}</div>"
+            "<footer>cuckoo telemetry · auto-refreshes every 5s</footer>"
+            "</body></html>"
+        )
+
     # ---------------------------------------------------------------- dispatch
 
     def handle(self, call: Call) -> str:
@@ -399,13 +593,8 @@ class Services:
             ptz = (
                 f'<tt:PTZConfiguration token="{PTZ_CONFIG}">'
                 f"<tt:Name>{PTZ_CONFIG}</tt:Name><tt:UseCount>1</tt:UseCount>"
-                "<tt:NodeToken>" + PTZ_NODE + "</tt:NodeToken>"
-                "<tt:DefaultAbsolutePantTiltPositionSpace>"
-                "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"
-                "</tt:DefaultAbsolutePantTiltPositionSpace>"
-                "<tt:DefaultAbsoluteZoomPositionSpace>"
-                "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"
-                "</tt:DefaultAbsoluteZoomPositionSpace>"
+                f"<tt:NodeToken>{PTZ_NODE}</tt:NodeToken>"
+                f"{PTZ_DEFAULT_SPACES}"
                 "</tt:PTZConfiguration>"
             )
         encoding = "H265" if track.codec.value == "h265" else track.codec.value.upper()
@@ -535,22 +724,7 @@ class Services:
         presets = len(camera.presets) if camera else 0
         return (
             f'<{element} token="{PTZ_NODE}"><tt:Name>{PTZ_NODE}</tt:Name>'
-            "<tt:SupportedPTZSpaces>"
-            "<tt:AbsolutePanTiltPositionSpace>"
-            "<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace</tt:URI>"
-            '<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>'
-            '<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>'
-            "</tt:AbsolutePanTiltPositionSpace>"
-            "<tt:AbsoluteZoomPositionSpace>"
-            "<tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace</tt:URI>"
-            "<tt:XRange><tt:Min>0.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
-            "</tt:AbsoluteZoomPositionSpace>"
-            "<tt:RelativePanTiltTranslationSpace>"
-            "<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationGenericSpace</tt:URI>"
-            "<tt:XRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:XRange>"
-            "<tt:YRange><tt:Min>-1.0</tt:Min><tt:Max>1.0</tt:Max></tt:YRange>"
-            "</tt:RelativePanTiltTranslationSpace>"
-            "</tt:SupportedPTZSpaces>"
+            f"<tt:SupportedPTZSpaces>{PTZ_SPACES}</tt:SupportedPTZSpaces>"
             f"<tt:MaximumNumberOfPresets>{max(64, presets)}</tt:MaximumNumberOfPresets>"
             "<tt:HomeSupported>false</tt:HomeSupported>"
             f"</{element}>"
@@ -562,11 +736,23 @@ class Services:
             f'<tptz:PTZConfiguration token="{PTZ_CONFIG}">'
             f"<tt:Name>{PTZ_CONFIG}</tt:Name><tt:UseCount>1</tt:UseCount>"
             f"<tt:NodeToken>{PTZ_NODE}</tt:NodeToken>"
+            f"{PTZ_DEFAULT_SPACES}"
             "</tptz:PTZConfiguration></tptz:GetConfigurationsResponse>"
         )
 
     def _get_configuration(self, call: Call) -> str:
         return self._get_configurations(call)
+
+    def _get_configuration_options(self, call: Call) -> str:
+        # Other clients (ODM, some NVRs) read move-mode support from here; Home
+        # Assistant instead reads it from the PTZConfiguration's Default*Space
+        # elements in GetProfiles (see PTZ_DEFAULT_SPACES). Answered for both.
+        return envelope(
+            "<tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions>"
+            f"<tt:Spaces>{PTZ_SPACES}</tt:Spaces>"
+            "<tt:PTZTimeout><tt:Min>PT1S</tt:Min><tt:Max>PT60S</tt:Max></tt:PTZTimeout>"
+            "</tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>"
+        )
 
     def _get_status(self, call: Call) -> str:
         camera = self.backend.camera()
@@ -575,7 +761,8 @@ class Services:
         self.backend.refresh_position()
         position = camera.motion.position
         pan = camera.pan_range.to_normalised(position.pan)
-        tilt = camera.tilt_range.to_normalised(position.tilt)
+        # Mirror the inverted tilt axis from _target_from so ONVIF +Y = up here too.
+        tilt = -camera.tilt_range.to_normalised(position.tilt)
         zoom = (camera.zoom_range.to_normalised(position.zoom) + 1.0) / 2.0
         state = "IDLE" if camera.motion.settled else "MOVING"
         return envelope(
@@ -592,6 +779,12 @@ class Services:
         current = camera.motion.position
         pan_tilt = call.vector("PanTilt")
         zoom = call.vector("Zoom")
+        if pan_tilt is not None:
+            # ONVIF's tilt axis is +Y = up; this camera's tilt value grows as the
+            # head drops, so a raw mapping sends "up" down. Invert Y once here so
+            # every client (HA, ODM, …) gets the intuitive direction, and mirror it
+            # in GetStatus below so reported position stays consistent.
+            pan_tilt = (pan_tilt[0], -pan_tilt[1])
         pan, tilt = current.pan, current.tilt
         if pan_tilt is not None:
             if relative:
@@ -656,7 +849,7 @@ class Services:
         body = ""
         for index, preset in sorted(camera.presets.items()):
             pan = camera.pan_range.to_normalised(preset.position.pan)
-            tilt = camera.tilt_range.to_normalised(preset.position.tilt)
+            tilt = -camera.tilt_range.to_normalised(preset.position.tilt)  # +Y = up, as elsewhere
             zoom = (camera.zoom_range.to_normalised(preset.position.zoom) + 1.0) / 2.0
             body += (
                 f'<tptz:Preset token="{index}"><tt:Name>{preset.name}</tt:Name>'
@@ -808,6 +1001,10 @@ class _Handler(BaseHTTPRequestHandler):
         log.debug("%s %s", self.address_string(), format % args)
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by http.server
+        root, _, _ = self.path.partition("?")
+        if root in ("/", "/status", "/status/"):
+            self._send(HTTPStatus.OK, self.services.status_page().encode(), "text/html; charset=utf-8")
+            return
         if self.path.startswith(SNAPSHOT_PATH):
             image = self.services.backend.snapshot()
             if image is None:

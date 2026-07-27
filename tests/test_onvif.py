@@ -241,8 +241,10 @@ def test_absolute_move_converts_to_motor_units() -> None:
         "AbsoluteMove",
         '<Position><PanTilt x="-1.0" y="1.0"/><Zoom x="1.0"/></Position>',
     )
+    # ONVIF +Y = up, and this camera's tilt axis is inverted, so y=1.0 (fully up)
+    # maps to the tilt *minimum*. The extremes still land on the camera's limits.
     assert recorder.absolute == [
-        Position(pan=PAN_RANGE.minimum, tilt=TILT_RANGE.maximum, zoom=ZOOM_RANGE.maximum, focus=50)
+        Position(pan=PAN_RANGE.minimum, tilt=TILT_RANGE.minimum, zoom=ZOOM_RANGE.maximum, focus=50)
     ], "the extremes must land on the camera's own limits, and focus is preserved"
 
 
@@ -266,7 +268,8 @@ def test_move_is_clamped_to_the_cameras_limits() -> None:
     service, recorder = services()
     ask(service, "AbsoluteMove", '<Position><PanTilt x="-5.0" y="5.0"/></Position>')
     assert recorder.absolute[0].pan == PAN_RANGE.minimum
-    assert recorder.absolute[0].tilt == TILT_RANGE.maximum
+    # y=+5 (up, past the limit) clamps to the tilt minimum under the inverted axis.
+    assert recorder.absolute[0].tilt == TILT_RANGE.minimum
 
 
 def test_move_without_a_camera_is_a_fault() -> None:
@@ -282,6 +285,31 @@ def test_nodes_advertise_the_generic_spaces_clients_look_for() -> None:
     assert "PanTiltSpaces/TranslationGenericSpace" in body
 
 
+def test_profile_ptz_configuration_declares_relative_and_continuous_defaults() -> None:
+    # Home Assistant reads move-mode support ONLY from the PTZConfiguration's
+    # Default*Space elements in GetProfiles. With just the absolute defaults it
+    # marks the camera PTZ-capable but logs "RelativeMove not supported" and
+    # no-ops every relative/continuous move (card buttons and onvif.ptz alike).
+    service, _ = services()
+    body = ask(service, "GetProfiles")
+    assert "DefaultRelativePanTiltTranslationSpace" in body
+    assert "DefaultContinuousPanTiltVelocitySpace" in body
+    assert "DefaultAbsolutePantTiltPositionSpace" in body
+
+
+def test_configuration_options_advertise_every_move_space() -> None:
+    # Home Assistant decides RelativeMove/ContinuousMove/AbsoluteMove support from
+    # this response, not from GetNodes. Missing the Spaces block here is what made
+    # HA log "RelativeMove not supported" and no-op every PTZ call.
+    service, _ = services()
+    body = ask(service, "GetConfigurationOptions", "<ConfigurationToken>PTZConfig</ConfigurationToken>")
+    assert "PTZConfigurationOptions" in body
+    assert "s:Fault" not in body
+    assert "RelativePanTiltTranslationSpace" in body
+    assert "AbsolutePanTiltPositionSpace" in body
+    assert "ContinuousPanTiltVelocitySpace" in body
+
+
 def test_presets_are_listed_with_normalised_positions() -> None:
     camera = a_camera()
     camera.presets[3] = Preset(3, "gate", Position(pan=500, tilt=8000, zoom=0, focus=0))
@@ -289,6 +317,30 @@ def test_presets_are_listed_with_normalised_positions() -> None:
     body = ask(service, "GetPresets")
     assert 'token="3"' in body and "<tt:Name>gate</tt:Name>" in body
     assert attributes_of(body, "PanTilt")["x"] == "-1.0000"
+    # tilt at its motor minimum reports as fully up (+1) under the inverted axis.
+    assert attributes_of(body, "PanTilt")["y"] == "1.0000"
+
+
+def test_status_page_renders_live_telemetry() -> None:
+    service, _ = services()
+    page = service.status_page()
+    assert page.startswith("<!doctype html>")
+    assert "adopted" in page and "Streams" in page
+    assert "rtsp://10.0.0.1:8554/" in page  # a real track URI from the backend
+
+
+def test_status_page_before_adoption_says_waiting() -> None:
+    service, _ = services_before_adoption()
+    page = service.status_page()
+    assert "waiting" in page and "No camera adopted" in page
+
+
+def test_tilt_axis_is_inverted_so_onvif_up_raises_the_head() -> None:
+    # The user saw up/down reversed: ONVIF +Y means up, but the camera's tilt
+    # value grows as the head drops, so "up" must lower the motor value.
+    service, recorder = services()
+    ask(service, "RelativeMove", '<Translation><PanTilt x="0" y="0.2"/></Translation>')
+    assert recorder.absolute[0].tilt < 13000, "ONVIF up must move toward the tilt minimum"
 
 
 def test_goto_preset_reaches_the_controller() -> None:
