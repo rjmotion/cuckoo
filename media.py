@@ -19,6 +19,8 @@ import queue
 import socket
 import socketserver
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Final, Iterator
 
@@ -30,6 +32,8 @@ INGEST_PORT: Final = 7550
 MJPEG_PORT: Final = 7551
 READ_SIZE: Final = 65536
 QUEUE_DEPTH: Final = 120  # a slow subscriber loses frames rather than stalling ingest
+BANDWIDTH_WINDOW: Final = 60.0  # seconds of byte samples kept for the live rate/graph
+BANDWIDTH_BUCKETS: Final = 40  # time slices the window is drawn as (the sparkline width)
 
 log = logging.getLogger("cuckoo.media")
 
@@ -92,6 +96,7 @@ class Stream:
     bytes_in: int = 0
     last_timestamp: int = 0
     _subscribers: list[Subscriber] = field(default_factory=list)
+    _samples: deque[tuple[float, int]] = field(default_factory=deque)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
@@ -121,6 +126,30 @@ class Stream:
         with self._lock:
             return len(self._subscribers)
 
+    def bandwidth(
+        self, window: float = BANDWIDTH_WINDOW, buckets: int = BANDWIDTH_BUCKETS
+    ) -> tuple[float, list[float]]:
+        """Windowed ingest telemetry for this track: (bytes/sec, per-bucket series).
+
+        The series buckets the window's byte samples into equal time slices, each
+        reported as bytes/sec, so the status page can draw a live sparkline rather
+        than one lifetime total. Empty slices read 0.
+        """
+        now = time.monotonic()
+        cutoff = now - window
+        with self._lock:
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
+            samples = list(self._samples)
+        rate = sum(n for _, n in samples) / window
+        slice_s = window / buckets
+        start = now - window
+        series = [0.0] * buckets
+        for ts, n in samples:
+            idx = int((ts - start) / slice_s)
+            series[min(buckets - 1, max(0, idx))] += n
+        return rate, [v / slice_s for v in series]
+
     def _fan_out(self, frame: Frame) -> None:
         with self._lock:
             targets = list(self._subscribers)
@@ -131,6 +160,13 @@ class Stream:
         """Turn one tag into a frame and republish it. Config tags return None."""
         self.bytes_in += len(tag.body)
         self.last_timestamp = tag.timestamp
+        if tag.body:
+            now = time.monotonic()
+            with self._lock:
+                self._samples.append((now, len(tag.body)))
+                cutoff = now - BANDWIDTH_WINDOW
+                while self._samples and self._samples[0][0] < cutoff:
+                    self._samples.popleft()
         if tag.kind is flv.TagType.VIDEO:
             return self._accept_video(tag)
         if tag.kind is flv.TagType.AUDIO:
@@ -211,6 +247,26 @@ class Hub:
     def names(self) -> list[str]:
         with self._lock:
             return sorted(self.streams)
+
+    def stats(self, window: float = BANDWIDTH_WINDOW) -> dict[str, dict[str, object]]:
+        """Per-track runtime telemetry, keyed by track name: byte-rate and its
+        windowed series (for a sparkline), lifetime bytes, frame/keyframe counts,
+        live RTSP subscribers, and whether the track is playable yet."""
+        with self._lock:
+            streams = list(self.streams.items())
+        out: dict[str, dict[str, object]] = {}
+        for name, stream in streams:
+            rate, series = stream.bandwidth(window)
+            out[name] = {
+                "rate_bps": rate,
+                "series": series,
+                "bytes_in": stream.bytes_in,
+                "frames": stream.frames,
+                "keyframes": stream.keyframes,
+                "subscribers": stream.subscriber_count,
+                "playable": stream.ready,
+            }
+        return out
 
     def publish(self, name: str, tag: flv.Tag) -> Frame | None:
         return self.stream(name).accept(tag)

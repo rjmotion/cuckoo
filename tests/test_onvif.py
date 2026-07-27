@@ -34,7 +34,21 @@ class Recorder:
             goto_preset=self._goto,
             set_preset=self._set_preset,
             remove_preset=self._remove,
+            telemetry=self._telemetry,
         )
+
+    def _telemetry(self) -> dict[str, dict[str, object]]:
+        return {
+            "video1": {
+                "rate_bps": 1_000_000.0,  # 8 Mbps
+                "series": [1.0, 4.0, 2.0, 8.0],
+                "bytes_in": 5_000_000,
+                "frames": 300,
+                "keyframes": 6,
+                "subscribers": 1,
+                "playable": True,
+            }
+        }
 
     def _move(self, position: Position) -> bool:
         self.absolute.append(position)
@@ -325,8 +339,10 @@ def test_status_page_renders_live_telemetry() -> None:
     service, _ = services()
     page = service.status_page()
     assert page.startswith("<!doctype html>")
-    assert "adopted" in page and "Streams" in page
+    assert "adopted" in page and "bandwidth" in page
     assert "rtsp://10.0.0.1:8554/" in page  # a real track URI from the backend
+    assert "<svg" in page and "Mbps" in page  # the bandwidth sparkline + rate
+    assert "prefers-color-scheme" in page  # light default, dark follows the OS
 
 
 def test_status_page_before_adoption_says_waiting() -> None:

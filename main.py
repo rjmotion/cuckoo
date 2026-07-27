@@ -270,6 +270,7 @@ def build(options: Options) -> Stack:
         remove_preset=remove_preset,
         refresh_position=refresh_position,
         set_encoder=set_encoder,
+        telemetry=hub.stats,
     )
     services = onvif.Services(backend, host=options.host, port=options.onvif_port)
     north = onvif.OnvifServer(services, port=options.onvif_port)

@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Final
 from xml.etree import ElementTree
 
+from media import BANDWIDTH_WINDOW
 from model import PAN, TILT, ZOOM, Camera, Position
 
 ONVIF_PORT: Final = 8000
@@ -165,6 +166,9 @@ class Backend:
     refresh_position: Callable[[], bool] = lambda: False
     # Re-arm a channel's codec live: (profile/config token, codec "h264"/"h265").
     set_encoder: Callable[[str, str], bool] = lambda _t, _c: False
+    # Per-track runtime telemetry keyed by track name (see media.Hub.stats): the
+    # windowed byte-rate + series, lifetime bytes, frames, subscribers, playable.
+    telemetry: Callable[[], dict[str, dict[str, object]]] = dict
 
 
 # ------------------------------------------------------------------------ events
@@ -364,15 +368,14 @@ class Services:
     # ------------------------------------------------------------- telemetry
 
     def status_page(self) -> str:
-        """A human-facing status page served at GET / on the ONVIF port.
+        """A human-facing telemetry page served at GET / on the ONVIF port.
 
-        Everything shown is read from live controller state — the adopted camera,
-        its tracks and codecs, the last known PTZ position (ONVIF convention and
-        raw motor units), presets, and the endpoints a client would point at.
+        Live controller state: the adopted camera and PTZ position, per-track
+        ingest bandwidth (rate, rolling-window sparkline, lifetime bytes, frames,
+        RTSP subscribers), presets, and the endpoints a client points at.
         """
         camera = self.backend.camera()
-        up = int(time.time() - self.started_at)
-        uptime = f"{up // 3600}h {up % 3600 // 60:02d}m {up % 60:02d}s"
+        tele = self.backend.telemetry()
 
         def esc(value: object) -> str:
             return html.escape(str(value))
@@ -380,8 +383,22 @@ class Services:
         def rows(*pairs: tuple[str, str]) -> str:
             return "".join(f"<tr><th>{esc(k)}</th><td>{v}</td></tr>" for k, v in pairs)
 
+        def num(stat: dict[str, object], key: str) -> float:
+            value = stat.get(key, 0)
+            return float(value) if isinstance(value, (int, float)) else 0.0
+
+        def series_of(stat: dict[str, object]) -> list[float]:
+            value = stat.get("series")
+            return [float(v) for v in value] if isinstance(value, list) else []
+
+        up = int(time.time() - self.started_at)
+        days, rem = divmod(up, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins, secs = divmod(rem, 60)
+        uptime = (f"{days}d " if days else "") + f"{hours:02d}:{mins:02d}:{secs:02d}"
+
         if camera is None:
-            body = "<section><h2>Camera</h2><p class='warn'>No camera adopted yet.</p></section>"
+            body = "<section><h2>Camera</h2><p class='muted'>No camera adopted yet.</p></section>"
         else:
             pos = camera.motion.position
             pan = camera.pan_range.to_normalised(pos.pan)
@@ -398,43 +415,65 @@ class Services:
             if camera.is_ptz:
                 cam += rows(
                     ("Position (ONVIF)", f"pan {pan:+.3f} · tilt {tilt:+.3f} · zoom {zoom:.3f}"),
-                    ("Position (motor)", f"pan {pos.pan} · tilt {pos.tilt} · zoom {pos.zoom} · focus {pos.focus}"),
-                    ("Pan range", f"{camera.pan_range.minimum}‥{camera.pan_range.maximum}"),
-                    ("Tilt range", f"{camera.tilt_range.minimum}‥{camera.tilt_range.maximum}"),
+                    ("Position (motor)", f"pan {pos.pan} · tilt {pos.tilt} · zoom {pos.zoom}"),
+                    ("Pan / tilt range",
+                     f"{camera.pan_range.minimum}‥{camera.pan_range.maximum} · "
+                     f"{camera.tilt_range.minimum}‥{camera.tilt_range.maximum}"),
                 )
+            camera_section = f"<section><h2>Camera</h2><table class='kv'>{cam}</table></section>"
 
-            track_rows = "".join(
-                f"<tr><td>{esc(t.name)}</td><td>{t.width}×{t.height}</td>"
-                f"<td>{esc(t.codec.value)}</td>"
-                f"<td class='mono'>{esc(self.backend.stream_uri(t.name))}</td></tr>"
-                for t in camera.tracks
-            )
-            tracks = (
-                "<section class='span'><h2>Streams</h2><table class='wide'>"
-                "<tr><th>Track</th><th>Resolution</th><th>Codec</th><th>RTSP URI</th></tr>"
-                f"{track_rows}</table></section>"
+            image = self.backend.snapshot()
+            live_section = (
+                f"<section><h2>Live snapshot</h2><img src='{SNAPSHOT_PATH}?t={up}' alt='snapshot'>"
+                "</section>"
+            ) if image else ""
+
+            track_rows = ""
+            for track in camera.tracks:
+                stat = tele.get(track.name, {})
+                playable = bool(stat.get("playable"))
+                dot = "ok" if playable else "warn"
+                track_rows += (
+                    "<tr>"
+                    f"<td><span class='dot {dot}'></span>{esc(track.name)}</td>"
+                    f"<td>{track.width}×{track.height}</td>"
+                    f"<td>{esc(track.codec.value)}</td>"
+                    f"<td class='num'>{esc(_fmt_rate(num(stat, 'rate_bps')))}</td>"
+                    f"<td class='spark-cell'>{_sparkline(series_of(stat))}</td>"
+                    f"<td class='num'>{esc(_fmt_bytes(num(stat, 'bytes_in')))}</td>"
+                    f"<td class='num'>{int(num(stat, 'frames'))} "
+                    f"<span class='muted'>/ {int(num(stat, 'keyframes'))} kf</span></td>"
+                    f"<td class='num'>{int(num(stat, 'subscribers'))}</td>"
+                    "</tr>"
+                )
+            bandwidth = (
+                "<section class='span'><h2>Streams &amp; bandwidth</h2><div class='scroll'>"
+                "<table class='wide'><tr><th>Track</th><th>Resolution</th><th>Codec</th>"
+                f"<th class='num'>Rate</th><th>Last {int(BANDWIDTH_WINDOW)}s</th>"
+                "<th class='num'>Total</th><th class='num'>Frames</th>"
+                f"<th class='num'>Subs</th></tr>{track_rows}</table></div></section>"
             )
 
             if camera.presets:
                 preset_rows = "".join(
-                    f"<tr><td>{i}</td><td>{esc(p.name)}</td></tr>"
+                    f"<tr><th>{i}</th><td>{esc(p.name)}</td></tr>"
                     for i, p in sorted(camera.presets.items())
                 )
-                presets = f"<section><h2>Presets</h2><table>{preset_rows}</table></section>"
+                presets = f"<section><h2>Presets</h2><table class='kv'>{preset_rows}</table></section>"
             else:
-                presets = "<section><h2>Presets</h2><p>None set.</p></section>"
+                presets = "<section><h2>Presets</h2><p class='muted'>None set.</p></section>"
 
-            endpoints = "<section><h2>Endpoints</h2><table>" + rows(
+            endpoint_rows = rows(
                 ("ONVIF", f"<span class='mono'>{esc(self.address(DEVICE_PATH))}</span>"),
                 ("Snapshot", f"<span class='mono'>{esc(self.address(SNAPSHOT_PATH))}</span>"),
-            ) + "</table></section>"
-
-            body = (
-                f"<section><h2>Camera</h2><table>{cam}</table></section>"
-                f"<section><h2>Live</h2><img src='{SNAPSHOT_PATH}' alt='snapshot' "
-                "onerror=\"this.style.display='none'\"></section>"
-                f"{tracks}{presets}{endpoints}"
+            ) + "".join(
+                f"<tr><th>RTSP {esc(t.name)}</th>"
+                f"<td><span class='mono'>{esc(self.backend.stream_uri(t.name))}</span></td></tr>"
+                for t in camera.tracks
             )
+            endpoints = f"<section class='span'><h2>Endpoints</h2><table class='kv'>{endpoint_rows}</table></section>"
+
+            body = camera_section + live_section + bandwidth + presets + endpoints
 
         state = "adopted" if camera else "waiting"
         badge = "ok" if camera else "warn"
@@ -443,38 +482,56 @@ class Services:
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
             "<meta http-equiv='refresh' content='5'><title>cuckoo · telemetry</title>"
             "<style>"
-            ":root{color-scheme:dark}"
-            "body{margin:0;background:#0d1117;color:#c9d1d9;"
-            "font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}"
-            "header{display:flex;align-items:center;gap:.6rem;padding:1rem 1.4rem;"
-            "border-bottom:1px solid #21262d}"
-            "h1{margin:0;font-size:1.3rem;letter-spacing:.5px}"
-            "h2{margin:0 0 .5rem;font-size:.8rem;text-transform:uppercase;"
-            "letter-spacing:.08em;color:#8b949e}"
-            ".badge{font-size:.72rem;padding:.15rem .5rem;border-radius:999px;text-transform:uppercase}"
-            ".badge.ok{background:#238636;color:#fff}.badge.warn{background:#9e6a03;color:#fff}"
-            ".meta{padding:.4rem 1.4rem;color:#8b949e;border-bottom:1px solid #21262d;margin:0}"
-            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));"
-            "gap:1rem;padding:1.4rem}"
-            "section{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:1rem}"
+            # Light default; dark follows the OS via prefers-color-scheme.
+            ":root{--bg:#f6f7f9;--panel:#fff;--fg:#1c2024;--muted:#6b7280;--line:#e4e7eb;"
+            "--head:#5b6472;--accent:#1f6feb;--ok:#1a7f37;--warn:#bf8700}"
+            "@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--panel:#161b22;"
+            "--fg:#e6edf3;--muted:#8b949e;--line:#21262d;--head:#8b949e;--accent:#58a6ff;"
+            "--ok:#3fb950;--warn:#d29922}}"
+            "*{box-sizing:border-box}"
+            "body{margin:0;background:var(--bg);color:var(--fg);"
+            "font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif}"
+            ".wrap{max-width:960px;margin:0 auto;padding:20px 16px}"
+            "header{display:flex;align-items:center;gap:.6rem;margin-bottom:.2rem}"
+            "h1{margin:0;font-size:1.25rem}"
+            "h2{margin:0 0 .6rem;font-size:.72rem;text-transform:uppercase;"
+            "letter-spacing:.07em;color:var(--head)}"
+            ".meta{color:var(--muted);font-size:.85rem;margin:.1rem 0 1.2rem}"
+            ".badge{font-size:.68rem;padding:.15rem .55rem;border-radius:999px;"
+            "text-transform:uppercase;color:#fff;background:var(--warn)}"
+            ".badge.ok{background:var(--ok)}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1rem}"
+            "section{background:var(--panel);border:1px solid var(--line);"
+            "border-radius:10px;padding:1rem;min-width:0}"
             "section.span{grid-column:1/-1}"
-            "table{border-collapse:collapse;width:100%}"
-            "th{text-align:left;color:#8b949e;font-weight:400;padding:.2rem .8rem .2rem 0;"
-            "white-space:nowrap;vertical-align:top}"
-            "td{padding:.2rem 0}"
-            "table.wide th{color:#8b949e;border-bottom:1px solid #21262d;padding-bottom:.4rem}"
-            "table.wide td{padding:.3rem .8rem .3rem 0}"
-            ".mono{font-family:ui-monospace,monospace;color:#79c0ff;word-break:break-all}"
-            ".warn{color:#e3b341}"
+            ".scroll{overflow-x:auto}"
+            "table{border-collapse:collapse;width:100%;font-size:.85rem}"
+            "table.kv th{text-align:left;color:var(--muted);font-weight:400;"
+            "padding:.22rem 1rem .22rem 0;white-space:nowrap;vertical-align:top}"
+            "table.kv td{padding:.22rem 0;word-break:break-word}"
+            "table.wide th{text-align:left;color:var(--head);font-weight:600;font-size:.72rem;"
+            "text-transform:uppercase;border-bottom:1px solid var(--line);padding:.3rem .8rem .4rem 0;"
+            "white-space:nowrap}"
+            "table.wide td{padding:.4rem .8rem;border-bottom:1px solid var(--line);white-space:nowrap}"
+            "table.wide tr:last-child td{border-bottom:none}"
+            ".num{text-align:right;font-variant-numeric:tabular-nums}"
+            ".muted{color:var(--muted)}"
+            ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
+            "font-size:.82rem;color:var(--accent);word-break:break-all}"
+            ".spark-cell{color:var(--accent);line-height:0;min-width:120px}"
+            ".spark{display:block;width:100%;max-width:220px}"
+            ".dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;"
+            "margin-right:.45rem;background:var(--warn);vertical-align:middle}"
+            ".dot.ok{background:var(--ok)}"
             "img{max-width:100%;border-radius:6px;display:block}"
-            "footer{padding:1rem 1.4rem;color:#484f58;font-size:.75rem}"
-            "</style></head><body>"
-            f"<header><h1>cuckoo</h1><span class='badge {badge}'>{state}</span></header>"
-            f"<p class='meta'>listening on {esc(self.host)}:{self.port} · "
-            f"uptime {uptime} · {self.subscriptions.count} event subscriber(s)</p>"
+            "footer{color:var(--muted);opacity:.7;font-size:.72rem;margin-top:1.2rem}"
+            "</style></head><body><div class='wrap'>"
+            f"<header><h1>cuckoo telemetry</h1><span class='badge {badge}'>{state}</span></header>"
+            f"<p class='meta'>{esc(self.host)}:{self.port} · uptime {uptime} · "
+            f"{self.subscriptions.count} event subscriber(s) · window {int(BANDWIDTH_WINDOW)}s</p>"
             f"<div class='grid'>{body}</div>"
-            "<footer>cuckoo telemetry · auto-refreshes every 5s</footer>"
-            "</body></html>"
+            "<footer>auto-refreshes every 5s</footer>"
+            "</div></body></html>"
         )
 
     # ---------------------------------------------------------------- dispatch
@@ -974,6 +1031,49 @@ class Services:
     def _only_subscription(self) -> str:
         with self.subscriptions._lock:  # noqa: SLF001 - same module
             return next(iter(self.subscriptions._queues), "")
+
+
+def _fmt_rate(bytes_per_sec: float) -> str:
+    bits = float(bytes_per_sec) * 8.0
+    for unit in ("bps", "kbps", "Mbps", "Gbps"):
+        if bits < 1000 or unit == "Gbps":
+            return f"{bits:.1f} {unit}"
+        bits /= 1000.0
+    return f"{bits:.1f} Gbps"
+
+
+def _fmt_bytes(nbytes: float) -> str:
+    value = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TB"
+
+
+def _sparkline(series: list[float], width: int = 200, height: int = 30) -> str:
+    """An inline SVG (area + line) of a byte-rate series, oldest→newest.
+
+    Self-contained, no JS or external assets, and uses currentColor so it inherits
+    the theme's accent in both light and dark mode. A flat/empty series is baseline.
+    """
+    if len(series) < 2:
+        return "<span class='muted'>—</span>"
+    peak = max(series) or 1.0
+    step = width / float(len(series) - 1)
+    points = [
+        (index * step, height - 2 - (value / peak) * (height - 4))
+        for index, value in enumerate(series)
+    ]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+    area = f"0,{height} {line} {width},{height}"
+    return (
+        f"<svg class='spark' viewBox='0 0 {width} {height}' width='{width}' "
+        f"height='{height}' preserveAspectRatio='none' role='img'>"
+        f"<polygon points='{area}' fill='currentColor' fill-opacity='0.15'/>"
+        f"<polyline points='{line}' fill='none' stroke='currentColor' "
+        "stroke-width='1.5' stroke-linejoin='round'/></svg>"
+    )
 
 
 def _snake(action: str) -> str:

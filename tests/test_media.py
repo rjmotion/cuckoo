@@ -160,6 +160,30 @@ def test_video_frames_carry_their_nal_units() -> None:
     assert frame.timestamp == 40
 
 
+def test_bandwidth_reports_a_windowed_rate_and_a_series() -> None:
+    stream = media.Stream(name="video1")
+    stream.accept(flv.Tag(flv.TagType.VIDEO, 0, video_body(6, hevc.PACKET_SEQUENCE_HEADER, hvcc())))
+    payload = video_body(flv.FrameType.KEY, hevc.PACKET_NALU, length_prefixed(IDR))
+    for timestamp in range(5):
+        stream.accept(flv.Tag(flv.TagType.VIDEO, timestamp, payload))
+    rate, series = stream.bandwidth()
+    assert rate > 0.0, "bytes moved, so the windowed rate must be positive"
+    assert len(series) == media.BANDWIDTH_BUCKETS
+    assert any(v > 0 for v in series), "recent traffic must land in a bucket"
+
+
+def test_hub_stats_reports_per_track_telemetry() -> None:
+    hub = media.Hub()
+    hub.stream("video1").accept(
+        flv.Tag(flv.TagType.VIDEO, 0, video_body(6, hevc.PACKET_SEQUENCE_HEADER, hvcc()))
+    )
+    stats = hub.stats()
+    assert "video1" in stats
+    entry = stats["video1"]
+    assert entry["playable"] is True
+    assert {"rate_bps", "series", "bytes_in", "frames", "keyframes", "subscribers"} <= set(entry)
+
+
 def test_two_byte_lengths_are_honoured_once_the_record_says_so() -> None:
     """A wrong length size reads garbage sizes, so this has to come from the hvcC."""
     stream = media.Stream(name="video1")
